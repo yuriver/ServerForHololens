@@ -15,6 +15,7 @@ public class Server : MonoBehaviour
     
     private const int PORT = 6067;
     private Thread listeningThread = null;
+    private TcpListener server = null;
     private bool serverRunning = true;
 
     public Texture2D testTexture;
@@ -45,9 +46,29 @@ public class Server : MonoBehaviour
         serverRunning = false;        
     }
 
+    void StopServer()
+    {
+        if (listeningThread.IsAlive)
+        {
+            listeningThread.Abort();
+        }
+
+        serverRunning = false;
+
+
+        try
+        {
+            server.Stop();
+        }
+        catch(Exception e)
+        {
+            UnityEngine.Debug.Log(e.Message);
+        }
+    }
+
     private void Listening()
     {
-        TcpListener server = new TcpListener(IPAddress.Any, PORT);
+        server = new TcpListener(IPAddress.Any, PORT);
         server.Start();
         UnityEngine.Debug.Log("Ready...");
         
@@ -105,13 +126,16 @@ public class Server : MonoBehaviour
 
                 // read messages.
                 int n = 0;
-                if ((n = ReadToFirstMessage(ref stream, ref buffer)) == 0)
+                if ((n = ReadToFirstMessage(ref stream, ref buffer)) < 1)
                 {
-                    break;
+                   break;
                 }
                 
                 imageLength = ReadToSecondMessage(ref stream, ref buffer, out hmdPosition, out hmdRotation);
-
+                if(imageLength < 0)
+                { 
+                    continue;
+                }
 
                 n = ReadToThirdMessage(ref stream, ref buffer);
 
@@ -162,9 +186,15 @@ public class Server : MonoBehaviour
 
         // get hmdPosition, hmdRotation, imageLength
         int imageLength = ParseData(data, out hmdPosition, out hmdRotation);
+        if(imageLength < 0)
+        {
+            return -1;
+        }
+
         buffer = new byte[imageLength];
 
         UnityEngine.Debug.Log("Received message 1/2.");
+        UnityEngine.Debug.LogFormat("image raw data Length: {0}", imageLength);
 
         return imageLength;
     }
@@ -198,7 +228,6 @@ public class Server : MonoBehaviour
 
         buffer = array.ToArray();
         UnityEngine.Debug.Log("buffer: " + buffer.Length);
-
         UnityEngine.Debug.Log("Received message 2/2.");
 
         return buffer.Length;
@@ -206,27 +235,38 @@ public class Server : MonoBehaviour
 
     private int ParseData(string data, out Vector3 hmdPosition, out Vector3 hmdRotation)
     {
-        string[] parts = data.Split(':');
-
-        string[] position = parts[0].Split('|');
-        string[] rotation = parts[1].Split('|');
-        string imageLength = parts[2];
-
-        hmdPosition = new Vector3()
+        try
         {
-            x = float.Parse(position[0]),
-            y = float.Parse(position[1]),
-            z = float.Parse(position[2])
-        };
+            string[] parts = data.Split(':');
 
-        hmdRotation = new Vector3()
+            string[] position = parts[0].Split('|');
+            string[] rotation = parts[1].Split('|');
+            string imageLength = parts[2];
+
+            hmdPosition = new Vector3()
+            {
+                x = float.Parse(position[0]),
+                y = float.Parse(position[1]),
+                z = float.Parse(position[2])
+            };
+
+            hmdRotation = new Vector3()
+            {
+                x = float.Parse(rotation[0]),
+                y = float.Parse(rotation[1]),
+                z = float.Parse(rotation[2])
+            };
+
+            return int.Parse(imageLength);
+        }        
+        catch(Exception e)
         {
-            x = float.Parse(rotation[0]),
-            y = float.Parse(rotation[1]),
-            z = float.Parse(rotation[2])
-        };
+            UnityEngine.Debug.Log("data: " + data + "\n" + e.Message + "\n" + e.StackTrace);
+
+            hmdPosition = hmdRotation = Vector3.zero;
+            return -1;
+        }
         
-        return int.Parse(imageLength);
     }
 
     private void SendTCPMessage(NetworkStream stream, string data)
@@ -252,6 +292,7 @@ public class Server : MonoBehaviour
     private async Task Processing(NetworkStream stream, byte[] imageRawData, Vector3 hmdPosition, Vector3 hmdRotation)
     {
         string imagePath = await SaveImage(imageRawData);
+        await Cropping(imagePath);
         string xmlPath = await Inference(imagePath);
         DetectionBox[] boxes = await ParseToXml(xmlPath);
 
@@ -282,6 +323,33 @@ public class Server : MonoBehaviour
         return Task.FromResult(path);
     }
 
+    private readonly string CROPPER_PATH = @"C:\HololensImages\image_cropper.py";
+    private async Task Cropping(string imagePath)
+    {
+        if (!File.Exists(imagePath))
+        {
+            UnityEngine.Debug.LogFormat("doesn't exist image({0})", imagePath);
+            return;
+        }
+
+
+        ProcessStartInfo startInfo = new ProcessStartInfo()
+        {
+            FileName = "python",
+            Arguments = string.Format("{0} {1}", CROPPER_PATH, imagePath),
+            UseShellExecute = false,
+            RedirectStandardOutput = true
+        };
+
+        using (Process process = Process.Start(startInfo))
+        {
+            using (StreamReader reader = process.StandardOutput)
+            {
+                await reader.ReadToEndAsync();
+            }
+        }
+    }
+
     private readonly string BAT_FILE_PATH = @"C:\HololensImages\inference.bat";
     private async Task<string> Inference(string imagePath)
     {
@@ -295,7 +363,7 @@ public class Server : MonoBehaviour
         ProcessStartInfo startInfo = new ProcessStartInfo()
         {
             FileName = BAT_FILE_PATH,
-            Arguments = imagePath,
+            Arguments = string.Format("{0}", imagePath),
             UseShellExecute = false,
             RedirectStandardOutput = true
         };
