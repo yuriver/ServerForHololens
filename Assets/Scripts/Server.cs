@@ -168,14 +168,23 @@ public class Server : MonoBehaviour
 
     private int ReadToFirstMessage(ref NetworkStream stream, ref byte[] buffer)
     {
-        buffer = new byte[sizeof(int)];
-        int nRead = stream.Read(buffer, 0, buffer.Length);
-        
-        int bufferSize = BitConverter.ToInt32(buffer, 0);
-        buffer = new byte[bufferSize];
+        int nRead = 0;
+        try
+        {
+            buffer = new byte[sizeof(int)];
+            nRead = stream.Read(buffer, 0, buffer.Length);
 
-        UnityEngine.Debug.Log("first message received, nRead: " + nRead);
+            int bufferSize = BitConverter.ToInt32(buffer, 0);
+            buffer = new byte[bufferSize];
 
+            UnityEngine.Debug.Log("first message received, nRead: " + nRead);
+
+        }
+        catch(Exception e)
+        {
+            nRead = -1;
+            UnityEngine.Debug.Log(e.Message + "\n" + e.StackTrace);
+        }
         return nRead;
     }
 
