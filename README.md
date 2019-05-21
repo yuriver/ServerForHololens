@@ -1,5 +1,5 @@
 # ServerForHololens
-University &amp; Industry cowork project (Team VAR &amp; Alchera Inc)  
+University &amp; Industry cowork project (Team VAR &amp; Alchera Inc.)  
 The 'TensorFlow' is not supported in the HoloLens, so the machine learning inference results are obtained by communicating with the PC.
 
 Our project is divided into Client(HoloLens), Server(PC), and Machine Learning(Neural Network Model, Inference) parts.
