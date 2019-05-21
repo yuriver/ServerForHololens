@@ -7,6 +7,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using System.Diagnostics;
 using System.Collections.Generic;
+using System.Linq;
 
 using UnityEngine;
 
@@ -18,7 +19,12 @@ public class Server : MonoBehaviour
     private TcpListener server = null;
     private bool serverRunning = true;
 
-    public Texture2D testTexture;
+    private byte[] testBuffer = null;
+
+    private Texture2D testTexture;
+    public UnityEngine.UI.Image testImageView;
+
+    private Stream stream = null;
 
     void Start()
     {
@@ -29,21 +35,19 @@ public class Server : MonoBehaviour
 
     void Update()
     {
-        if (Input.GetMouseButtonDown(0))
+        if (testBuffer != null)
         {
-            Vector3 pos = Input.mousePosition;
-            UnityEngine.Debug.Log(pos.x + ", " + pos.y + ", " + pos.z);
+            Texture2D tex = ImageUtil.RawToTexture2D(testBuffer);
+            Sprite sprite = ImageUtil.TextureToSprite(tex);
+
+            testImageView.sprite = sprite;
+            testBuffer = null;
         }
     }
 
     void OnApplicationQuit()
     {
-        if (listeningThread.IsAlive)
-        {
-            listeningThread.Abort();
-        }
-
-        serverRunning = false;        
+        StopServer();      
     }
 
     void StopServer()
@@ -79,10 +83,11 @@ public class Server : MonoBehaviour
                 try
                 {
                     TcpClient client = server.AcceptTcpClient();
+                    stream = client.GetStream();
                     UnityEngine.Debug.Log("Connected client.");
 
-                    Thread receivingThread = new Thread(new ParameterizedThreadStart(Receiving));
-                    receivingThread.Start(client as object);
+                    Thread receivingThread = new Thread(Receiving);
+                    receivingThread.Start();
                 }
                 catch(Exception e)
                 {
@@ -99,55 +104,44 @@ public class Server : MonoBehaviour
         listeningThread.Start();
     }
 
-    private void Receiving(object o)
+    private void Receiving()
     {
-        TcpClient client = o as TcpClient;
-        NetworkStream stream = client.GetStream();
-
-        byte[] buffer = null;
+        byte[] imageRawData = null;
         Vector3 hmdPosition, hmdRotation;
-
-        int imageLength = 0;
         
         while (serverRunning)
         {
             try
             {
                 /* 
-                 * first message format
+                 * first message header
                  * [ size of second message(int) ]
                 
-                 * second message format
-                 * [ hmdPosition.x | hmdPosition.y | hmdPosition.z : hdmRotation.x | hmdRotation.y | hmdRotation.z : rawdataLength(int) ]
-                 
-                 * third message format
-                 * [ rawdata(bytes) ]
+                 * second message body
+                 * [ hmdPosition.x | hmdPosition.y | hmdPosition.z : hdmRotation.x | hmdRotation.y | hmdRotation.z : rawdataLength(int) : image raw data ]
                  */
 
-                // read messages.
+
+                // read message header
                 int n = 0;
-                if ((n = ReadToFirstMessage(ref stream, ref buffer)) < 1)
+                if ((n = ReadMessageHeader()) > 0)
                 {
-                   break;
+                    byte[] data = ReadMessageBody(n);
+
+                    ParseData(data.ToList(), out hmdPosition, out hmdRotation, out imageRawData);
+
+                    // light inference and send message
+                    Processing(hmdPosition, hmdRotation,imageRawData);
+                } 
+                else
+                {
+                    break;
                 }
-                
-                imageLength = ReadToSecondMessage(ref stream, ref buffer, out hmdPosition, out hmdRotation);
-                if(imageLength < 0)
-                { 
-                    continue;
-                }
-
-                n = ReadToThirdMessage(ref stream, ref buffer);
-
-
-                UnityEngine.Debug.LogFormat("second message's length: {0}\nthird message's length: {1}", imageLength, n);
-
-                // light inference and send message
-                Processing(stream, buffer, hmdPosition, hmdRotation);                
             }
             catch (Exception e)
             {
                 UnityEngine.Debug.Log(e.Message + "\n" + e.StackTrace);
+                stream = null;
                 break;
             }
         }
@@ -158,99 +152,63 @@ public class Server : MonoBehaviour
             stream.Dispose();
             stream = null;
         }
-
-        if(client != null)
-        {
-            client.Close();
-            client.Dispose();
-        }
     }
 
-    private int ReadToFirstMessage(ref NetworkStream stream, ref byte[] buffer)
+    private int ReadMessageHeader()
     {
-        int nRead = 0;
+        int bodyLength = -1;
+        byte[] buffer = null;
+
         try
         {
             buffer = new byte[sizeof(int)];
-            nRead = stream.Read(buffer, 0, buffer.Length);
+            stream.Read(buffer, 0, buffer.Length);
+            bodyLength = BitConverter.ToInt32(buffer, 0);            
 
-            int bufferSize = BitConverter.ToInt32(buffer, 0);
-            buffer = new byte[bufferSize];
-
-            UnityEngine.Debug.Log("first message received, nRead: " + nRead);
-
+            UnityEngine.Debug.Log("message header received: " + bodyLength);
         }
         catch(Exception e)
         {
-            nRead = -1;
             UnityEngine.Debug.Log(e.Message + "\n" + e.StackTrace);
         }
-        return nRead;
+
+        return bodyLength;
     }
 
-    private int ReadToSecondMessage(ref NetworkStream stream, ref byte[] buffer, out Vector3 hmdPosition, out Vector3 hmdRotation)
+    private byte[] ReadMessageBody(int messageLength)
     {
-        int nRead = stream.Read(buffer, 0, buffer.Length);
-        string data = Encoding.UTF8.GetString(buffer);
-
-        // get hmdPosition, hmdRotation, imageLength
-        int imageLength = ParseData(data, out hmdPosition, out hmdRotation);
-        if(imageLength < 0)
-        {
-            return -1;
-        }
-
-        buffer = new byte[imageLength];
-
-        UnityEngine.Debug.Log("Received message 1/2.");
-        UnityEngine.Debug.LogFormat("image raw data Length: {0}", imageLength);
-
-        return imageLength;
-    }
-
-    private int ReadToThirdMessage(ref NetworkStream stream, ref byte[] buffer)
-    {
-        //int nRead = stream.Read(buffer, 0, buffer.Length);
-
-        int nRead = 0;
-        byte[] temp = null;
-        List<byte> array = new List<byte>();
-
-        int remained = buffer.Length;
-        UnityEngine.Debug.Log("remained: " + remained);
+        int remained = messageLength;
+        byte[] buffer = null;
+        List<byte> message = new List<byte>();
 
         while(remained > 0)
         {
-            if (remained > 1024)
-            {
-                temp = new byte[1024];                
-            }
-            else
-            {
-                temp = new byte[remained];
-            }
+            buffer = new byte[remained > 1024 ? 1024 : remained];
+            stream.Read(buffer, 0, buffer.Length);
 
-            stream.Read(temp, 0, temp.Length);
-            remained -= temp.Length;
-            array.AddRange(temp);            
+            message.AddRange(buffer);
+            remained -= buffer.Length;
+            buffer.Initialize();            
         }
-
-        buffer = array.ToArray();
-        UnityEngine.Debug.Log("buffer: " + buffer.Length);
-        UnityEngine.Debug.Log("Received message 2/2.");
-
-        return buffer.Length;
+                
+        return message.ToArray();
     }
 
-    private int ParseData(string data, out Vector3 hmdPosition, out Vector3 hmdRotation)
+    private void ParseData(List<byte> data, out Vector3 hmdPosition, out Vector3 hmdRotation, out byte[] imageRawdata)
     {
         try
         {
-            string[] parts = data.Split(':');
+            string temp = Encoding.UTF8.GetString(data.ToArray());
 
-            string[] position = parts[0].Split('|');
-            string[] rotation = parts[1].Split('|');
-            string imageLength = parts[2];
+            int firstColon = temp.IndexOf(':', 0);
+            int secondColon = temp.IndexOf(':', firstColon + 1);
+
+            string[] position = temp.Substring(0, firstColon).Split('|');
+            string[] rotation = temp.Substring(firstColon + 1, secondColon - firstColon - 1).Split('|');
+            int imageOffset = secondColon + 1;
+
+            //UnityEngine.Debug.LogFormat("HmdInfo Length: {0}", secondColon + 1);
+            //UnityEngine.Debug.LogFormat("{0} : {1}", string.Join(", ", position), string.Join(", ", rotation));
 
             hmdPosition = new Vector3()
             {
@@ -266,19 +224,19 @@ public class Server : MonoBehaviour
                 z = float.Parse(rotation[2])
             };
 
-            return int.Parse(imageLength);
+            imageRawdata = data.GetRange(imageOffset, data.Count - imageOffset).ToArray();
+            //imageRawdata = Encoding.UTF8.GetBytes(data);
         }        
         catch(Exception e)
         {
-            UnityEngine.Debug.Log("data: " + data + "\n" + e.Message + "\n" + e.StackTrace);
+            UnityEngine.Debug.Log("data: " + data + "\n" + e.Source + "\n" + e.StackTrace);
 
             hmdPosition = hmdRotation = Vector3.zero;
-            return -1;
-        }
-        
+            imageRawdata = null;
+        }        
     }
 
-    private void SendTCPMessage(NetworkStream stream, string data)
+    private void SendTCPMessage(string data)
     {
         if (stream != null)
         {
@@ -296,12 +254,19 @@ public class Server : MonoBehaviour
 
             sendingThread.Start();
         }
+        else
+        {
+            UnityEngine.Debug.Log("Stream is null!");
+        }
     }
 
-    private async Task Processing(NetworkStream stream, byte[] imageRawData, Vector3 hmdPosition, Vector3 hmdRotation)
+    private async Task Processing(Vector3 hmdPosition, Vector3 hmdRotation, byte[] imageRawData)
     {
         string imagePath = await SaveImage(imageRawData);
         await Cropping(imagePath);
+
+        testBuffer = File.ReadAllBytes(imagePath);
+
         string xmlPath = await Inference(imagePath);
         DetectionBox[] boxes = await ParseToXml(xmlPath);
 
@@ -312,7 +277,15 @@ public class Server : MonoBehaviour
             boxes = boxes
         };
 
-        SendTCPMessage(stream, message.ToString());
+        if(message.boxes.Length > 0)
+        {
+            SendTCPMessage(message.ToString());
+        }
+        else
+        {
+            UnityEngine.Debug.Log("Not detected.");
+        }
+        
     }
 
     private Task<string> SaveImage(byte[] imageRawData)
